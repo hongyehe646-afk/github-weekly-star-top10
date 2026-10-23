@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 程序运行时生成的文件 (每台机器不同, 不入库)
+settings.json
+trending_cache.json
+trending_cache.json.bak
+debug.log
+.debug
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
