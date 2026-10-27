@@ -665,6 +665,7 @@ DEFAULT_SETTINGS = {
     "bgdim": 0.42,         # 背景图压暗程度 0~0.85 (越大文字越清楚)
     "cardop": 0.86,        # 卡片不透明度 0.45~1.0 (越小越透, 越能看见背景图)
     "wallmode": True,      # 壁纸模式: 文字直接压在图上, 不画卡片色块
+    "glass": 0.55,         # 毛玻璃强度 0~1 (0 = 关, 越大越磨砂)
     "token": "",           # 可选 GitHub Token: 抓取提速 3 倍 (30次/分钟 + 4路并发)
 }
 
@@ -794,6 +795,82 @@ def _bg_view_cached(path, w, h, dim, base_hex):
         _BGVIEW_MEM.clear()
     _BGVIEW_MEM[key] = view
     return view
+
+
+def _blur_fast(im, radius=16, shrink=4):
+    """毛玻璃的"模糊底": 缩到 1/4 做高斯再放大回来。
+
+    全尺寸 1460×940 上做 radius=16 的高斯要 40ms 以上, 降 4 倍再升回来
+    只要 3ms 左右, 肉眼看不出区别 (反正要的就是"糊")。
+    """
+    Image = _pil()
+    if im is None or Image is None:
+        return None
+    try:
+        from PIL import ImageFilter as _IF
+        w, h = im.size
+        f = max(1, int(shrink))
+        r = max(0.5, float(radius)) / f
+        small = im.resize((max(2, w // f), max(2, h // f)), Image.BILINEAR)
+        small = small.filter(_IF.GaussianBlur(r))
+        return small.resize((w, h), Image.BILINEAR)
+    except Exception:
+        return im
+
+
+def _glass_plate(sharp, blur, box, rad=13, tint="#0d1017", amount=0.22,
+                 strength=1.0, edge=None, mask_cache=None):
+    """一块"磨砂玻璃"贴片, 圆角内 = 模糊+染色, 圆角外 = 原像素。
+
+    Tk 的 canvas 图元没法跟**底下的图元**做 alpha 混合 (RGBA 只会跟画布
+    底色混), 所以这里用 PIL 先把"原图 + 圆角玻璃"合成成一张不透明图再贴,
+    贴回去与壁纸严丝合缝, 没有半透明接缝。
+    """
+    Image = _pil()
+    if sharp is None or blur is None or Image is None:
+        return None
+    try:
+        from PIL import ImageDraw as _ID
+        box = tuple(int(v) for v in box)
+        if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+            return None
+        base = sharp.crop(box)
+        frosted = blur.crop(box)
+        a = max(0.0, min(0.92, float(amount) * max(0.0, min(1.0, float(strength)))))
+        if a > 0.004:
+            frosted = Image.blend(frosted,
+                                  Image.new("RGB", frosted.size, _hex2rgb(tint)), a)
+        r = int(max(0, min(rad, (base.size[1] - 1) // 2, (base.size[0] - 1) // 2)))
+        key = (base.size, r)
+        mask = mask_cache.get(key) if mask_cache is not None else None
+        if mask is None:
+            mask = Image.new("L", base.size, 0)
+            _ID.Draw(mask).rounded_rectangle(
+                [0, 0, base.size[0] - 1, base.size[1] - 1], radius=r, fill=255)
+            if mask_cache is not None:
+                if len(mask_cache) > 48:
+                    mask_cache.clear()
+                mask_cache[key] = mask
+        out = Image.composite(frosted, base, mask)
+        if edge:                    # 1px 玻璃边: 让"这是一层面板"读得出来
+            try:
+                _ID.Draw(out).rounded_rectangle(
+                    [0, 0, base.size[0] - 1, base.size[1] - 1], radius=r,
+                    outline=_hex2rgb(edge), width=1)
+            except Exception:
+                pass
+            # 顶边再压一道更亮的高光: 玻璃"接光"的那一面
+            try:
+                hi = _ID.Draw(out)
+                hi.rounded_rectangle([1, 1, base.size[0] - 2, base.size[1] - 2],
+                                     radius=max(0, r - 1),
+                                     outline=_hex2rgb(_mix(edge, "#ffffff", 0.55)),
+                                     width=1)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return None
 
 
 def _bg_tile_vertical(base, w, h):
@@ -2504,7 +2581,8 @@ class TrendingApp(tk.Tk):
         """重画一条文字栏: 壁纸模式下贴该位置的壁纸, 再左右对齐画文字。"""
         cv = bar.cv
         try:
-            w = max(160, cv.winfo_width())
+            nw = cv.winfo_width()          # 真实宽度: ◀ ▶ 箭头条只有 22px
+            w = max(160, nw)
         except tk.TclError:
             return
         cv.delete("all")
@@ -2513,22 +2591,48 @@ class TrendingApp(tk.Tk):
         if self._wall_mode() and getattr(self, "_bg_pil", None) is not None:
             try:
                 y0 = cv.winfo_rooty() - self.winfo_rooty()
-                pil = self._bg_pil
+                xoff = max(0, cv.winfo_rootx() - self.winfo_rootx())
+                glass = max(0.0, min(1.0, float(SETTINGS.get("glass", 0.55) or 0)))
+                bl = getattr(self, "_glass_pil", None)
+                use_glass = glass > 0.02 and bl is not None
+                pil = bl if use_glass else self._bg_pil
                 bw, bh = pil.size
                 y1 = min(bh, max(0, y0) + bar.height)
-                crop = pil.crop((0, max(0, y0), min(bw, w), y1))
-                # 壁纸比这条栏窄/矮时 (窗口刚改尺寸、还没重建背景) 直接拉伸铺满,
-                # 否则右侧/底部会露出纯色条, 看着像"这里没有背景图"
-                if crop.size != (int(w), int(bar.height)):
-                    try:
-                        from PIL import Image as _Im
-                        crop = crop.resize((max(2, int(w)), max(2, int(bar.height))),
-                                           _Im.LANCZOS)
-                    except Exception:
-                        pass
-                from PIL import ImageTk
-                bar._img = ImageTk.PhotoImage(crop)
-                bar.img_id = cv.create_image(0, 0, anchor="nw", image=bar._img)
+                if nw < 90:
+                    # 22px 宽的 ◀ ▶ 箭头条: 贴一整张图容易和分类条错位 (看着像深色块),
+                    # 直接取同一位置的玻璃平均色做平涂, 视觉上是同一条带子
+                    avg = _bg_avg(pil, (xoff, max(0, y0), min(bw, xoff + max(24, nw)), y1))
+                    if avg:
+                        if use_glass:
+                            avg = _mix(avg, BG_DARK, min(0.16, 0.10 * glass))
+                        try:
+                            cv.configure(bg=avg)
+                        except tk.TclError:
+                            pass
+                    bar._img = None
+                else:
+                    crop = pil.crop((xoff, max(0, y0), min(bw, xoff + w), y1))
+                    if use_glass and crop.size[0] > 4 and crop.size[1] > 4:
+                        try:      # 三条文字栏整体做成一条磨砂玻璃带 (照片还看得见)
+                            from PIL import Image as _Im
+                            # 只给一点点底色: 压太狠就变成"深色横带", 壁纸被挡住
+                            crop = _Im.blend(crop, _Im.new("RGB", crop.size,
+                                                           _hex2rgb(BG_DARK)),
+                                             min(0.16, 0.10 * glass))
+                        except Exception:
+                            pass
+                    # 壁纸比这条栏窄/矮时 (窗口刚改尺寸、还没重建背景) 直接拉伸铺满,
+                    # 否则右侧/底部会露出纯色条, 看着像"这里没有背景图"
+                    if crop.size != (int(w), int(bar.height)):
+                        try:
+                            from PIL import Image as _Im
+                            crop = crop.resize((max(2, int(w)), max(2, int(bar.height))),
+                                               _Im.LANCZOS)
+                        except Exception:
+                            pass
+                    from PIL import ImageTk
+                    bar._img = ImageTk.PhotoImage(crop)
+                    bar.img_id = cv.create_image(0, 0, anchor="nw", image=bar._img)
             except Exception:
                 bar._img = None
         _dbg("paint_bar w=%s h=%s items=%d wall=%s pil=%r crop=%r" % (
@@ -2638,18 +2742,32 @@ class TrendingApp(tk.Tk):
             return
         try:
             vw = max(60, self._filter_canvas.winfo_width())
+            cwid = max(vw, self._chip_cv.winfo_reqwidth(), self._chip_cv.winfo_width())
             x0 = self._filter_canvas.winfo_rootx() - self.winfo_rootx()
             y0 = self._chip_cv.winfo_rooty() - self.winfo_rooty()
             off = self._filter_canvas.canvasx(0)
             bw, bh = self._bg_pil.size
+            chh = max(20, self._chip_cv.winfo_height())
         except Exception:
             return
-        key = (vw, x0, y0)
+        key = (cwid, x0, y0, chh)
         try:
             if getattr(self, "_chips_bg_key", None) != key:
-                crop = self._bg_pil.crop((max(0, x0), max(0, y0),
-                                          min(bw, max(0, x0) + vw),
-                                          min(bh, max(0, y0) + 36)))
+                glass = self._glass_strength()
+                bl = getattr(self, "_glass_pil", None)
+                use_glass = glass > 0.02 and bl is not None
+                src = bl if use_glass else self._bg_pil
+                # 整条内容宽度都贴图 (不只视口), 否则横向滚到右边会露出纯色底
+                crop = src.crop((max(0, x0), max(0, y0),
+                                 min(min(bw, src.size[0]), max(0, x0) + cwid),
+                                 min(bh, max(0, y0) + chh)))
+                if use_glass and crop.size[0] > 4 and crop.size[1] > 4:
+                    try:      # 与三条文字栏同一层玻璃, 整条 chrome 才是一块料
+                        from PIL import Image as _Im
+                        crop = _Im.blend(crop, _Im.new("RGB", crop.size, _hex2rgb(BG_DARK)),
+                                         min(0.16, 0.10 * glass))
+                    except Exception:
+                        pass
                 from PIL import ImageTk
                 self._chips_img = ImageTk.PhotoImage(crop)
                 self._chips_bg_key = key
@@ -2658,10 +2776,10 @@ class TrendingApp(tk.Tk):
                         cv.delete(self._chips_img_id)
                     except Exception:
                         pass
-                self._chips_img_id = cv.create_image(off, 0, anchor="nw",
+                self._chips_img_id = cv.create_image(0, 0, anchor="nw",
                                                      image=self._chips_img)
             else:
-                cv.coords(self._chips_img_id, off, 0)
+                cv.coords(self._chips_img_id, 0, 0)
             cv.tag_lower(self._chips_img_id)
         except Exception:
             pass
@@ -2746,8 +2864,8 @@ class TrendingApp(tk.Tk):
             items.append((n, ("%s %s  %d" % (emoji, n, counts[n])).strip(), fam_name))
 
         font = self._font(10, "bold")
-        # 一层同色系影子就够; 两层纯黑/纯白描边在 1.5x DPI 下像重影
-        halo_col = _shadow_of(_mix(PALETTE["ui"]["text"], BG_DARK, 0.20))
+        # 分类条现在压在磨砂玻璃条上(亮度已归一), 再叠一层描边就会出现"重影字"
+        halo_col = None
         x = 4
         self._chip_order = []
         text_items = []
@@ -2756,7 +2874,7 @@ class TrendingApp(tk.Tk):
             hot = fam_p["accent"] if fam_p else PALETTE["科技"]["accent"]
             base = _mix(PALETTE["ui"]["text"], BG_DARK, 0.20)
             w = font.measure(label) + 20
-            sh = cv.create_text(x + w // 2 + 1, 18, text=label, fill=halo_col, font=font)
+            sh = None
             sh2 = None
             t = cv.create_text(x + w // 2, 17, text=label, fill=base, font=font)
             self._chips[name] = {"x": x, "w": w, "rect": None, "text": t,
@@ -3136,7 +3254,24 @@ class TrendingApp(tk.Tk):
         except Exception:
             pass
         self._bg_follow()
+        self._fade_sync()
         self._scroll_bar_hint()
+
+    def _fade_sync(self):
+        """只有滚到最顶上时才显示"磨砂 → 清晰"的渐隐条。"""
+        try:
+            at_top = self.canvas.yview()[0] <= 0.0015
+        except Exception:
+            return
+        has = bool(self.canvas.find_withtag("fade"))
+        if at_top and not has:
+            self._top_fade()
+            try:
+                self.canvas.tag_lower("fade", "content")
+            except Exception:
+                pass
+        elif not at_top and has:
+            self.canvas.delete("fade")
 
     def _wheel(self, event):
         if event.widget.winfo_toplevel() is not self:
@@ -3159,6 +3294,7 @@ class TrendingApp(tk.Tk):
         except tk.TclError:
             return
         self._bg_follow()
+        self._fade_sync()
         if step:
             self._sv_step(step)
         return "break"
@@ -3432,6 +3568,7 @@ class TrendingApp(tk.Tk):
         self._bg_photo = None
         self._bg_tile_photo = None
         self._bg_item = None
+        self._glass_pil = None
         try:
             self.canvas.delete("bgimg")
         except Exception:
@@ -3478,6 +3615,7 @@ class TrendingApp(tk.Tk):
         try:
             self._bg_view = view
             self._bg_pil = view
+            self._glass_pil = _blur_fast(view, 10 + 20 * self._glass_strength())
             self._bg_photo = ImageTk.PhotoImage(view)
             if self._bg_lbl is not None:
                 self._bg_lbl.configure(image=self._bg_photo, bg=BG_DARK, text="")
@@ -3912,10 +4050,100 @@ class TrendingApp(tk.Tk):
                 c[key] = v
         return v
 
+    def _glass_strength(self):
+        """毛玻璃强度 0~1 (0 = 关)。"""
+        try:
+            return max(0.0, min(1.0, float(SETTINGS.get("glass", 0.55) or 0)))
+        except Exception:
+            return 0.0
+
+    def _wall_plate(self, y0, y1, accent_hex=None, hot=False):
+        """在行后面贴一块圆角毛玻璃: 文字始终读得清, 壁纸仍然透得出来。"""
+        g = self._glass_strength()
+        if g <= 0.02:
+            return None
+        sharp = getattr(self, "_bg_pil", None)
+        blur = getattr(self, "_glass_pil", None)
+        if sharp is None or blur is None:
+            return None
+        c = self.canvas
+        try:
+            cw = max(160, c.winfo_width())
+            dy = c.winfo_rooty() - self.winfo_rooty()
+            wy0 = int(dy + c.canvasy(y0))
+            h = int(max(10, y1 - y0))
+            if wy0 < 0:
+                wy0, h = 0, h + wy0
+            h = min(h, max(10, sharp.size[1] - wy0))
+            box = (6, wy0, cw - 6, wy0 + h)
+            accent = accent_hex or PALETTE["ui"]["text"]
+            light_theme = _luma(BG_DARK) > 0.5
+            pavg = _bg_avg(blur, (max(0, box[0]), max(0, box[1]),
+                                  max(0, box[2]), max(0, box[3]))) or BG_DARK
+            if hot:
+                tint = accent
+                amount = 0.15
+                edge = _mix(accent, "#ffffff" if _luma(accent) < 0.62 else "#000000", 0.45)
+            else:
+                tint = BG_DARK
+                amount = 0.26 + 0.10 * g
+                edge = _mix(pavg, "#ffffff" if not light_theme else "#05070c", 0.52)
+            img = _glass_plate(sharp, blur, box, rad=14, tint=tint, amount=amount,
+                               strength=g, edge=edge,
+                               mask_cache=getattr(self, "_mask_cache", None))
+            if img is None:
+                return None
+            from PIL import ImageTk
+            ph = ImageTk.PhotoImage(img)
+            refs = getattr(self, "_plate_refs", None)
+            if refs is None:
+                refs = self._plate_refs = []
+            refs.append(ph)
+            if len(refs) > 80:
+                del refs[:30]
+            return c.create_image(box[0], wy0 - dy, anchor="nw", image=ph,
+                                  tags=("glass",))
+        except Exception:
+            return None
+
+    def _top_fade(self, hgt=34):
+        """列表顶部一条"磨砂 → 清晰"的渐隐, 让标题栏的玻璃和列表照片无缝接上。"""
+        if self._glass_strength() <= 0.02:
+            return
+        sharp = getattr(self, "_bg_pil", None)
+        blur = getattr(self, "_glass_pil", None)
+        if sharp is None or blur is None:
+            return
+        try:
+            from PIL import Image as _Im
+            from PIL import ImageTk
+            c = self.canvas
+            cw = max(160, c.winfo_width())
+            dy = max(0, c.winfo_rooty() - self.winfo_rooty())
+            box = (0, dy, cw, min(sharp.size[1], dy + hgt))
+            if box[3] - box[1] < 4:
+                return
+            a = sharp.crop(box)          # 清晰
+            b = blur.crop(box)           # 磨砂
+            col = _Im.new("L", (1, a.size[1]))
+            for yy in range(a.size[1]):
+                col.putpixel((0, yy), int(255 * (1 - yy / float(max(1, a.size[1] - 1)))))
+            grad = col.resize((a.size[0], a.size[1]))
+            out = _Im.composite(b, a, grad)   # 顶部磨砂, 向下渐变回清晰
+            ph = ImageTk.PhotoImage(out)
+            self._fade_ref = ph
+            c.create_image(0, 0, anchor="nw", image=ph, tags=("bgimg", "fade"))
+        except Exception:
+            pass
+
     def _draw_wall(self, secs, first=None):
         c = self.canvas
         c.delete("content")
         c.delete("hover")
+        c.delete("glass")
+        self._plate_refs = []
+        if not hasattr(self, "_mask_cache"):
+            self._mask_cache = {}
         self._row_bands = []
         self._hover_repo = None
         ui = PALETTE["ui"]
@@ -3952,47 +4180,54 @@ class TrendingApp(tk.Tk):
             self._txt(x0 + 26 + self._m(f_head, title), y + 14, sub, f_headsub,
                       _mix(h_ink, "#ffffff" if _luma(h_ink) < 0.5 else "#000000", 0.30),
                       halo_fill=h_halo)
-            y += lh_head + 26
+            y += lh_head + 34
 
             for rank, r in rows:
                 top = y + 3
                 rp = PALETTE[r["category"]]
                 _hasd = bool(r["desc"] or (self._lang != "off" and r.get("desc_tr")))
-                est = (top + lh_title + (2 * lh_desc if (_hasd and self._details_on) else 0)
-                       + (lh_meta if self._details_on else 0) + 12)
+                _showd = _hasd and self._details_on
+                # 行高只按"真正要画的东西"算, 再把每一行文字垂直居中到它那一格里
+                body = (lh_title + (2 * lh_desc if _showd else 0)
+                        + (lh_meta if self._details_on else 0))
+                est = top + body + 14
                 ink, halo = self._band_ink(top - 4, est, xt, xt + desc_w)
+                self._wall_plate(top - 7, est - 8)  # 毛玻璃底: 圆角内模糊, 上下留缝
                 _away = "#ffffff" if _luma(ink) < 0.5 else "#000000"
                 dcol = _mix(ink, _away, 0.16)
                 mcol = _mix(ink, _away, 0.30)
+                cy = top + lh_title // 2           # 标题/名次/星数共用一条中线
                 if rank <= 3:
-                    self._txt(xr + 6, top - 3, str(rank), f_rank, rp["hl"], halo_fill=halo)
+                    self._txt(xr + 6, cy, str(rank), f_rank, rp["hl"], anchor="w", halo=False)
                 else:
-                    self._txt(xr + 6, top + 2, str(rank), self._font(16, "bold"),
-                              ui["muted"], halo_fill=halo)
-                self._txt(xt, top, r["full_name"], f_title, ink, halo_fill=halo)
-                self._txt(xstar, top + 1, f"★ {r['stars']:,}", f_star, rp["hl"],
-                          anchor="ne", halo_fill=halo)
-                y = top + lh_title + 1
+                    self._txt(xr + 6, cy, str(rank), self._font(16, "bold"),
+                              ui["muted"], anchor="w", halo=False)
+                self._txt(xt, cy, r["full_name"], f_title, ink, anchor="w", halo=False)
+                self._txt(xstar, cy, f"★ {r['stars']:,}", f_star, rp["hl"],
+                          anchor="e", halo=False)
+                y = top + lh_title
 
                 desc = r["desc"] or ""
                 if self._lang != "off" and r.get("desc_tr"):
                     desc = r["desc_tr"]
-                if desc and self._details_on:
+                if _showd:
                     for line in self._wrap(desc, f_desc, desc_w, 2):
-                        self._txt(xt, y, line, f_desc, dcol, halo_fill=halo)
+                        self._txt(xt, y + lh_desc // 2, line, f_desc, dcol, anchor="w", halo=False)
                         y += lh_desc
                 if self._details_on:
                     meta = (f"主语言: {r['lang'] or '未知'}　·　"
                             f"Forks: {r['forks']:,}　·　Issues: {r['issues']:,}")
-                    self._txt(xt, y + 1, meta, f_meta, mcol, halo_fill=halo)
-                    y += lh_meta + 2
-                y += 12
-                self._row_bands.append((top - 5, y - 6, r))
+                    self._txt(xt, y + lh_meta // 2, meta, f_meta, mcol, anchor="w", halo=False)
+                    y += lh_meta
+                y += 11
+                self._row_bands.append((top - 4, est - 2, r))
                 self._rows.append({"card": None, "pal": rp, "open": rank <= 10,
                                    "repo": r, "colors": None, "bg_widgets": None})
 
         total = max(y + 10, c.winfo_height())
         c.configure(scrollregion=(0, 0, W, total))
+        c.delete("fade")
+        self._top_fade()
         c.tag_raise("content")
         self.canvas.configure(bg=BG_DARK)
         self.after(0, self._force_repaint)
@@ -4012,12 +4247,15 @@ class TrendingApp(tk.Tk):
         """按照片在该行区域的平均亮度选深色/浅色文字 (+ 相反色描边)。"""
         ui = PALETTE["ui"]
         try:
-            v = self._bg_view
+            g = self._glass_strength()
+            bl = getattr(self, "_glass_pil", None)
+            v = bl if (g > 0.02 and bl is not None) else self._bg_view
             if v is None:
                 return ui["text"], None
             c = self.canvas
-            wy0 = max(0.0, c.canvasy(y0))
-            wy1 = max(wy0 + 4, c.canvasy(y1))
+            dy = c.winfo_rooty() - self.winfo_rooty()    # 画布在窗口里的纵向偏移
+            wy0 = max(0.0, dy + c.canvasy(y0))
+            wy1 = max(wy0 + 4, dy + c.canvasy(y1))
             vw, vh = v.size
             cw = max(1, c.winfo_width())
             sc = vw / float(cw)
@@ -4030,6 +4268,9 @@ class TrendingApp(tk.Tk):
             av = _bg_avg(v, (bx0, by0, bx1, by1))
             if not av:
                 return ui["text"], None
+            if g > 0.02 and bl is not None:
+                # 文字真正压在"磨砂 + 染色"之后, 不能只按原图亮度决定黑白
+                av = _mix(av, BG_DARK, min(0.60, 0.26 + 0.10 * g))
             light = _luma(av) > 0.56
         except Exception:
             return ui["text"], None
@@ -4074,9 +4315,17 @@ class TrendingApp(tk.Tk):
         for y0, y1, r in self._row_bands:
             if r is hit:
                 acc = PALETTE[r["category"]]["accent"]
-                self.canvas.create_rectangle(12, y1 - 2, self.canvas.winfo_width() - 14, y1,
-                                             fill=acc, outline="", tags="hover")
-                self.canvas.tag_lower("hover", "content")
+                iid = self._wall_plate(y0, y1 + 2, accent_hex=acc, hot=True)
+                if iid is not None:
+                    try:
+                        self.canvas.itemconfigure(iid, tags=("hover",))
+                        self.canvas.tag_raise("hover", "glass")
+                    except Exception:
+                        pass
+                # 左侧 2px 类别色条: 当前行有明确落点 (不是糊一团)
+                self.canvas.create_rectangle(8, y0 + 3, 11, y1 - 1, fill=acc,
+                                             outline="", tags="hover")
+                self.canvas.tag_raise("hover", "glass")
                 break
 
     def _wall_open(self, e):
@@ -4354,6 +4603,7 @@ class SettingsDialog(tk.Toplevel):
         self.var_img = tk.StringVar(value=SETTINGS.get("bgimg", "") or "")
         self.var_dim = tk.DoubleVar(value=float(SETTINGS.get("bgdim", 0.42)))
         self.var_op = tk.DoubleVar(value=float(SETTINGS.get("cardop", 0.86)))
+        self.var_glass = tk.DoubleVar(value=float(SETTINGS.get("glass", 0.55)))
 
         # ── 标题条 ──────────────────────────────────────────
         head = tk.Frame(self._shell, bg=head_bg)
@@ -4502,6 +4752,13 @@ class SettingsDialog(tk.Toplevel):
         sec = section("显示", "")
         self._check(sec, "卡片默认展开详情行（简介 + 语言 / Star / Fork / Issue）", self.var_det)
         self._check(sec, "壁纸模式（文字直接压在图上, 卡片不挡背景）", self.var_wall)
+        grow = tk.Frame(sec, bg=panel)
+        grow.pack(fill="x", pady=(13, 2))
+        self._slider(grow, "毛玻璃强度", self.var_glass, 0.0, 1.0)
+        tk.Label(sec, text="每行垫一层圆角磨砂: 照片糊在里面还看得见, 文字不用描边也读得清。"
+                           "0 = 关掉, 回到纯净的「字直接压照片」。",
+                 font=("Microsoft YaHei UI", 9), bg=panel, fg=ui["sub"],
+                 justify="left", wraplength=560).pack(fill="x", pady=(2, 2))
 
         # ── 底部按钮条 ──────────────────────────────────────
         foot = tk.Frame(self._shell, bg=BG_DARK)
@@ -5175,6 +5432,7 @@ class SettingsDialog(tk.Toplevel):
         self.var_img.set("")
         self.var_dim.set(DEFAULT_SETTINGS["bgdim"])
         self.var_op.set(DEFAULT_SETTINGS["cardop"])
+        self.var_glass.set(DEFAULT_SETTINGS["glass"])
         self._mark_selected()
 
     def _test_token(self):
@@ -5228,6 +5486,10 @@ class SettingsDialog(tk.Toplevel):
             op = max(0.45, min(1.0, float(self.var_op.get())))
         except Exception:
             op = DEFAULT_SETTINGS["cardop"]
+        try:
+            gl = max(0.0, min(1.0, float(self.var_glass.get())))
+        except Exception:
+            gl = DEFAULT_SETTINGS["glass"]
         new = {
             "bg": ok(self.var_bg.get(), DEFAULT_SETTINGS["bg"]),
             "tech": ok(self.var_tech.get(), DEFAULT_SETTINGS["tech"]),
@@ -5238,6 +5500,7 @@ class SettingsDialog(tk.Toplevel):
             "bgimg": img,
             "bgdim": round(dim, 2),
             "cardop": round(op, 2),
+            "glass": round(gl, 2),
             "token": (self.var_token.get() or "").strip(),
         }
         self._close()
